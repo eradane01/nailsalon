@@ -179,7 +179,7 @@ ui <- fluidPage(
           style = "margin-bottom: 1rem;"
         ),
         div(
-          class = "grid grid-cols-1 lg:grid-cols-3 gap-8",
+          class = "grid grid-cols-1 gap-8",
           
           # Add Customer Form (hidden until Add button is clicked)
           tags$section(
@@ -250,7 +250,7 @@ ui <- fluidPage(
             style = "margin-bottom: 1rem;"
           ),
           div(
-            class = "grid grid-cols-1 lg:grid-cols-3 gap-8",
+            class = "grid grid-cols-1 gap-8",
             
             # Appointment Form (hidden until Add button is clicked)
             tags$section(
@@ -429,12 +429,16 @@ server <- function(input, output, session) {
   
   # Reactive values for data storage (seed from DB)
   customers <- reactiveVal(db_load_customers())
-  appts_data <- db_load_appointments()
-  # Automatically set past pending appointments to missed
-  if (nrow(appts_data) > 0) {
+  appointments <- reactiveVal(db_load_appointments())
+  
+  # Reactive timer to auto-update missed appointments every minute
+  observe({
+    invalidateLater(60000, session)  # 60,000 ms = 1 minute
+    appts_data <- appointments()
+    updated <- FALSE
     today <- Sys.Date()
     current_time <- format(Sys.time(), "%I:%M %p")
-    for (i in 1:nrow(appts_data)) {
+    for (i in seq_len(nrow(appts_data))) {
       appt_date <- as.Date(appts_data$date[i])
       appt_time <- appts_data$time_slot[i]
       if (appts_data$status[i] == "pending") {
@@ -442,11 +446,14 @@ server <- function(input, output, session) {
           appts_data$status[i] <- "missed"
           # Update in DB
           db_update_appointment(list(id = appts_data$id[i], customer_name = appts_data$customer_name[i], services = appts_data$services[i], date = appts_data$date[i], time_slot = appts_data$time_slot[i], total_price = appts_data$total_price[i], status = "missed", loyalty_points = appts_data$loyalty_points[i], is_redemption = appts_data$is_redemption[i], created_at = appts_data$created_at[i]))
+          updated <- TRUE
         }
       }
     }
-  }
-  appointments <- reactiveVal(appts_data)
+    if (updated) {
+      appointments(appts_data)
+    }
+  })
   
   # Editing state
   editing_customer_id <- reactiveVal(NULL)
@@ -594,12 +601,21 @@ server <- function(input, output, session) {
   
   output$customer_filter <- renderUI({
     cust_data <- customers()
-    choices <- c("All Customers" = "")
+    # Use a non-empty sentinel so Selectize always shows it
+    choices <- c("All Customers" = "__ALL__")
     if (nrow(cust_data) > 0) {
       cust_data <- cust_data[order(cust_data$name), ]
-      choices <- c(choices, setNames(cust_data$name, cust_data$name))
+      cust_names <- cust_data$name
+      names(cust_names) <- cust_data$name
+      choices <- c(choices, cust_names)
     }
-    selectInput("filter_customer", "Filter by Customer:", choices = choices, selected = "", width = "200px")
+    selectInput(
+      "filter_customer",
+      "Filter by Customer:",
+      choices = choices,
+      selected = if (is.null(input$filter_customer) || input$filter_customer == "") "__ALL__" else input$filter_customer,
+      width = "200px"
+    )
   })
   
   # ============================================
@@ -685,6 +701,12 @@ server <- function(input, output, session) {
               )
             },
             actionButton(
+              paste0("view_transactions_", customer$id),
+              HTML("🧾 Points Receipt"),
+              class = "btn-hover",
+              style = "background-color: #10b981; color: #ffffff; padding: 0.5rem 1rem; border-radius: 0.75rem; font-weight: 700;"
+            ),
+            actionButton(
               paste0("edit_customer_", customer$id),
               HTML("✏️ Edit"),
               class = "btn-hover",
@@ -729,11 +751,14 @@ server <- function(input, output, session) {
       if (filter_type != "archived") {
         appt_data <- appt_data[appt_data$status != "archived", ]
       }
+      
+      # Exclude cancelled free appointments from the appointments tab
+      appt_data <- appt_data[!(appt_data$status == "cancelled" & appt_data$is_redemption == TRUE), ]
     }
     
     # Filter by customer if selected
     selected_customer <- input$filter_customer
-    if (!is.null(selected_customer) && selected_customer != "") {
+    if (!is.null(selected_customer) && selected_customer != "" && selected_customer != "__ALL__") {
       appt_data <- appt_data[appt_data$customer_name == selected_customer, ]
     }
     
@@ -843,9 +868,24 @@ server <- function(input, output, session) {
                       style = "background-color: #ffc0cb; color: #4a154b;"
                     )
                   )
+                } else if (filter_type %in% c("today", "upcoming") && is_done) {
+                  tagList(
+                    actionButton(
+                      paste0("undo_appt_", appt$id),
+                      HTML("↶ Undone"),
+                      class = "action-btn",
+                      style = "background-color: #fbbf24; color: #ffffff;"
+                    ),
+                    actionButton(
+                      paste0("archive_appt_", appt$id),
+                      HTML("📦 Archive"),
+                      class = "action-btn",
+                      style = "background-color: #9ca3af; color: #ffffff; margin-left: 0.5rem;"
+                    )
+                  )
                 } else if (filter_type %in% c("today", "upcoming")) {
                   list(
-                    if (!is_done) {
+                    if (!is_done && appt$status != "cancelled") {
                       actionButton(
                         paste0("done_appt_", appt$id),
                         HTML("✅ Done"),
@@ -864,21 +904,12 @@ server <- function(input, output, session) {
                       class = "action-btn",
                       style = "background-color: #dc2626; color: #ffffff;"
                     ),
-                    if (is_done) {
-                      actionButton(
-                        paste0("archive_appt_", appt$id),
-                        HTML("📦 Archive"),
-                        class = "action-btn",
-                        style = "background-color: #9ca3af; color: #ffffff;"
-                      )
-                    } else {
-                      actionButton(
-                        paste0("delete_appt_", appt$id),
-                        HTML("🗑️"),
-                        class = "action-btn",
-                        style = "background-color: #ffc0cb; color: #4a154b;"
-                      )
-                    }
+                    actionButton(
+                      paste0("delete_appt_", appt$id),
+                      HTML("🗑️"),
+                      class = "action-btn",
+                      style = "background-color: #ffc0cb; color: #4a154b;"
+                    )
                   )
                 } else if (filter_type == "cancelled") {
                   list(
@@ -903,11 +934,33 @@ server <- function(input, output, session) {
                         HTML("🔄 Restore"),
                         class = "action-btn",
                         style = "background-color: #10b981; color: #ffffff;"
+                      ),
+                      actionButton(
+                        paste0("delete_appt_", appt$id),
+                        HTML("🗑️"),
+                        class = "action-btn",
+                        style = "background-color: #ffc0cb; color: #4a154b; margin-left: 0.5rem;"
+                      )
+                    )
+                  } else if (is_done) {
+                    # For ALL appointments with DONE status, always show undone and archive
+                    tagList(
+                      actionButton(
+                        paste0("undo_appt_", appt$id),
+                        HTML("↶ Undone"),
+                        class = "action-btn",
+                        style = "background-color: #fbbf24; color: #ffffff;"
+                      ),
+                      actionButton(
+                        paste0("archive_appt_", appt$id),
+                        HTML("📦 Archive"),
+                        class = "action-btn",
+                        style = "background-color: #9ca3af; color: #ffffff; margin-left: 0.5rem;"
                       )
                     )
                   } else {
                     list(
-                      if (!is_done) {
+                      if (!is_done && appt$status != "cancelled") {
                         actionButton(
                           paste0("done_appt_", appt$id),
                           HTML("✅ Done"),
@@ -931,18 +984,12 @@ server <- function(input, output, session) {
                           )
                         }
                       },
-                      if (is_done) {
+                      if (filter_type == "all" && appt$status == "pending") {
                         actionButton(
-                          paste0("archive_appt_", appt$id),
-                          HTML("📦 Archive"),
+                          paste0("cancel_appt_", appt$id),
+                          HTML("❌ Cancel"),
                           class = "action-btn",
-                          style = "background-color: #9ca3af; color: #ffffff;"
-                        )
-                        actionButton(
-                          paste0("undo_appt_", appt$id),
-                          HTML("↶ Undone"),
-                          class = "action-btn",
-                          style = "background-color: #fbbf24; color: #ffffff;"
+                          style = "background-color: #dc2626; color: #ffffff;"
                         )
                       },
                       if (!is_done) {
@@ -986,9 +1033,9 @@ server <- function(input, output, session) {
                             "archived" = redemptions[redemptions$status == "archived", ],
                             redemptions
       )
-      # Exclude archived from all filter
+      # Exclude archived and cancelled from 'All' filter
       if (redemption_filter == "all") {
-        redemptions <- redemptions[redemptions$status != "archived", ]
+        redemptions <- redemptions[!redemptions$status %in% c("archived", "cancelled"), ]
       }
     }
     
@@ -1068,11 +1115,19 @@ server <- function(input, output, session) {
               div(
                 class = "action-buttons",
                 if (redemption$status == "archived") {
-                  actionButton(
-                    paste0("restore_redemption_", redemption$id),
-                    HTML("🔄 Restore"),
-                    class = "action-btn",
-                    style = "background-color: #10b981; color: #ffffff;"
+                  list(
+                    actionButton(
+                      paste0("restore_redemption_", redemption$id),
+                      HTML("🔄 Restore"),
+                      class = "action-btn",
+                      style = "background-color: #10b981; color: #ffffff;"
+                    ),
+                    actionButton(
+                      paste0("delete_redemption_", redemption$id),
+                      HTML("🗑️"),
+                      class = "action-btn",
+                      style = "background-color: #ffc0cb; color: #4a154b;"
+                    )
                   )
                 } else {
                   list(
@@ -1081,6 +1136,14 @@ server <- function(input, output, session) {
                         paste0("complete_redemption_", redemption$id),
                         HTML("✅ Complete"),
                         class = "action-btn btn-success"
+                      )
+                    },
+                    if (redemption$status == "redeemed") {
+                      actionButton(
+                        paste0("unredeem_redemption_", redemption$id),
+                        HTML("↩️ Unredeem"),
+                        class = "action-btn",
+                        style = "background-color: #f59e0b; color: #ffffff;"
                       )
                     },
                     actionButton(
@@ -1319,6 +1382,24 @@ server <- function(input, output, session) {
     }, ignoreInit = TRUE, once = TRUE)
   }
   
+  # Helper to show cancel modal
+  show_cancel_modal <- function(item_type, item_id, on_confirm) {
+    showModal(modalDialog(
+      title = div(class = "font-playfair text-2xl font-bold", "Confirm Cancel"),
+      p(class = "font-cormorant text-lg", paste0("Are you sure you want to cancel this ", item_type, "? It will be marked as cancelled.")),
+      footer = tagList(
+        actionButton("modal_confirm_cancel", "Yes, Cancel", class = "btn-hover", style = "background-color: #dc2626; color: #ffffff; padding: 0.75rem 1.5rem; border-radius: 1rem;"),
+        modalButton("Keep")
+      ),
+      easyClose = TRUE
+    ))
+    
+    observeEvent(input$modal_confirm_cancel, {
+      on_confirm()
+      removeModal()
+    }, ignoreInit = TRUE, once = TRUE)
+  }
+  
   # Watch for any button clicks
   observe({
     # Get all input names
@@ -1368,6 +1449,84 @@ server <- function(input, output, session) {
       })
     }
     
+    # Customer transactions/receipt buttons
+    view_tx_btns <- grep("^view_transactions_", all_inputs, value = TRUE)
+    for (btn in view_tx_btns) {
+      local({
+        btn_name <- btn
+        cust_id <- sub("^view_transactions_", "", btn_name)
+        
+        observeEvent(input[[btn_name]], {
+          cust_data <- customers()
+          cust <- cust_data[cust_data$id == cust_id, ]
+          if (nrow(cust) > 0) {
+            cust_name <- cust$name[1]
+            current_appts <- appointments()
+            # Transactions: appointments that earned points (loyalty_points > 0)
+            tx <- current_appts[tolower(current_appts$customer_name) == tolower(cust_name) &
+                                  as.numeric(current_appts$loyalty_points) > 0, ]
+            
+            # Build rows
+            tx_rows <- list()
+            total_pts <- 0
+            if (nrow(tx) > 0) {
+              for (i in seq_len(nrow(tx))) {
+                ap <- tx[i, ]
+                date_str <- if (!is.na(ap$date) && ap$date != "") format(as.Date(ap$date), "%b %d, %Y") else format(as.POSIXct(ap$created_at), "%b %d, %Y")
+                services <- strsplit(ap$services, ",")[[1]]
+                svc_tags <- lapply(services, function(sv) {
+                  sv_clean <- trimws(sv)
+                  pts <- 0
+                  for (s in services_list) { if (sv_clean == s$name) { pts <- s$points; break } }
+                  span(class = "service-tag", paste0(sv_clean, " (", pts, " pts)"))
+                })
+                pts_earned <- as.integer(ap$loyalty_points)
+                total_pts <- total_pts + pts_earned
+                tx_rows[[length(tx_rows)+1]] <- tags$tr(
+                  tags$td(class = "p-3", paste0("📅 ", date_str)),
+                  tags$td(class = "p-3", div(class = "flex flex-wrap gap-1", svc_tags)),
+                  tags$td(class = "p-3", span(class = "status-badge", ap$status)),
+                  tags$td(class = "p-3", strong(paste0(pts_earned, " pts")))
+                )
+              }
+            }
+            
+            showModal(modalDialog(
+              title = div(class = "font-playfair text-2xl font-bold", paste0("🧾 Points Receipt — ", cust_name)),
+              size = "l",
+              easyClose = TRUE,
+              footer = tagList(modalButton("Close")),
+              div(
+                class = "mb-3",
+                span(class = "font-montserrat text-sm", "This lists all appointments that earned points for this customer.")
+              ),
+              if (length(tx_rows) == 0) {
+                div(class = "empty-state", p(class = "font-cormorant text-lg", "No point-earning appointments yet."))
+              } else {
+                tagList(
+                  tags$table(
+                    class = "w-full",
+                    tags$thead(
+                      tags$tr(
+                        tags$th(class = "text-left p-3", "Date"),
+                        tags$th(class = "text-left p-3", "Services"),
+                        tags$th(class = "text-left p-3", "Status"),
+                        tags$th(class = "text-left p-3", "Points Earned")
+                      )
+                    ),
+                    tags$tbody(tx_rows)
+                  ),
+                  div(class = "mt-4 p-3 rounded-xl",
+                      style = "background-color: #f0fdf4; border: 2px solid #86efac;",
+                      span(class = "font-playfair text-xl font-bold", paste0("Total Points: ", total_pts, " pts"))
+                  )
+                )
+              }
+            ))
+          }
+        }, ignoreInit = TRUE)
+      })
+    }
     # Redeem buttons
     redeem_btns <- grep("^redeem_", all_inputs, value = TRUE)
     for (btn in redeem_btns) {
@@ -1388,7 +1547,7 @@ server <- function(input, output, session) {
                 p(class = "font-cormorant text-lg", paste0(cust$name[1], " has ", total_points, " points. Redeem 100 points for a free service?")),
                 dateInput("redeem_date", "Appointment Date", value = Sys.Date(), min = Sys.Date()),
                 selectInput("redeem_time", "Time Slot", choices = c("Select time slot" = "", time_slots)),
-                selectInput("redeem_service", "Choose Service", choices = setNames(sapply(services_list, function(s) s$id), sapply(services_list, function(s) paste0(s$name, " \u20B1", s$price))), selected = sapply(services_list, function(s) s$id)[1]),
+                selectInput("redeem_service", "Choose Service", choices = setNames(sapply(services_list, function(s) s$id), sapply(services_list, function(s) s$name)), selected = sapply(services_list, function(s) s$id)[1]),
                 footer = tagList(
                   actionButton("confirm_redeem", HTML("🎁 Redeem & Schedule"), class = "btn-hover", style = "background-color: #ff69b4; color: #ffffff; padding: 0.75rem 1.5rem; border-radius: 1rem;"),
                   modalButton("Cancel")
@@ -1583,15 +1742,17 @@ server <- function(input, output, session) {
         appt_id <- sub("^cancel_appt_", "", btn_name)
         
         observeEvent(input[[btn_name]], {
-          current_appts <- appointments()
-          idx <- which(current_appts$id == appt_id)
-          if (length(idx) > 0) {
-            current_appts[idx, "status"] <- "cancelled"
-            appointments(current_appts)
-            # Persist cancel
-            db_update_appointment(list(id = appt_id, customer_name = current_appts[idx, "customer_name"], services = current_appts[idx, "services"], date = current_appts[idx, "date"], time_slot = current_appts[idx, "time_slot"], total_price = as.numeric(current_appts[idx, "total_price"]), status = "cancelled", loyalty_points = as.integer(current_appts[idx, "loyalty_points"]), is_redemption = as.logical(current_appts[idx, "is_redemption"]), created_at = current_appts[idx, "created_at"]))
-            showNotification("Appointment cancelled successfully", type = "message")
-          }
+          show_cancel_modal("appointment", appt_id, function() {
+            current_appts <- appointments()
+            idx <- which(current_appts$id == appt_id)
+            if (length(idx) > 0) {
+              current_appts[idx, "status"] <- "cancelled"
+              appointments(current_appts)
+              # Persist cancel
+              db_update_appointment(list(id = appt_id, customer_name = current_appts[idx, "customer_name"], services = current_appts[idx, "services"], date = current_appts[idx, "date"], time_slot = current_appts[idx, "time_slot"], total_price = as.numeric(current_appts[idx, "total_price"]), status = "cancelled", loyalty_points = as.integer(current_appts[idx, "loyalty_points"]), is_redemption = as.logical(current_appts[idx, "is_redemption"]), created_at = current_appts[idx, "created_at"]))
+              showNotification("Appointment cancelled successfully", type = "message")
+            }
+          })
         }, ignoreInit = TRUE)
       })
     }
@@ -1669,6 +1830,96 @@ server <- function(input, output, session) {
     
     # Redemption archive buttons
     archive_redemption_btns <- grep("^archive_redemption_", all_inputs, value = TRUE)
+    # Redemption unredeem buttons
+    unredeem_redemption_btns <- grep("^unredeem_redemption_", all_inputs, value = TRUE)
+    for (btn in unredeem_redemption_btns) {
+      local({
+        btn_name <- btn
+        redemption_id <- sub("^unredeem_redemption_", "", btn_name)
+        
+        observeEvent(input[[btn_name]], {
+          showModal(modalDialog(
+            title = div(class = "font-playfair text-2xl font-bold", "Confirm Unredeem"),
+            p(class = "font-cormorant text-lg", "Are you sure you want to unredeem? The appointment will be cancelled and the 100 points will be returned to the customer."),
+            footer = tagList(
+              actionButton("confirm_unredeem", "Yes, Unredeem", class = "btn-hover", style = "background-color: #f59e0b; color: #ffffff; padding: 0.75rem 1.5rem; border-radius: 1rem;"),
+              modalButton("Cancel")
+            ),
+            easyClose = FALSE
+          ))
+          
+          observeEvent(input$confirm_unredeem, {
+            current_appts <- appointments()
+            idx <- which(current_appts$id == redemption_id)
+            if (length(idx) > 0) {
+              customer_name <- current_appts[idx, "customer_name"]
+              
+              # Add back 100 points across customer's done or archived appointments, capped by their service points
+              customer_done_idx <- which(
+                tolower(current_appts$customer_name) == tolower(customer_name) &
+                  current_appts$status %in% c("done", "archived")
+              )
+              
+              # Prefer most recent appointments first
+              if (length(customer_done_idx) > 1) {
+                ord <- order(as.POSIXct(current_appts$created_at[customer_done_idx]), decreasing = TRUE)
+                customer_done_idx <- customer_done_idx[ord]
+              }
+              
+              points_to_add <- 100
+              if (length(customer_done_idx) > 0) {
+                for (didx in customer_done_idx) {
+                  if (points_to_add <= 0) break
+                  # Compute maximum points for this appointment from its service(s)
+                  svc_names <- strsplit(current_appts[didx, "services"], ",")[[1]]
+                  max_pts <- 0
+                  for (svc in svc_names) {
+                    for (s in services_list) {
+                      if (trimws(svc) == s$name) {
+                        max_pts <- max_pts + s$points
+                        break
+                      }
+                    }
+                  }
+                  current_pts <- as.integer(current_appts[didx, "loyalty_points"])
+                  add_here <- max_pts - current_pts
+                  if (add_here > 0) {
+                    add_val <- min(add_here, points_to_add)
+                    current_appts[didx, "loyalty_points"] <- current_pts + add_val
+                    points_to_add <- points_to_add - add_val
+                  }
+                }
+                # Persist loyalty point restorations
+                for (didx in customer_done_idx) {
+                  ap <- list(
+                    id = current_appts[didx, "id"],
+                    customer_name = current_appts[didx, "customer_name"],
+                    services = current_appts[didx, "services"],
+                    date = current_appts[didx, "date"],
+                    time_slot = current_appts[didx, "time_slot"],
+                    total_price = as.numeric(current_appts[didx, "total_price"]),
+                    status = current_appts[didx, "status"],
+                    loyalty_points = as.integer(current_appts[didx, "loyalty_points"]),
+                    is_redemption = as.logical(current_appts[didx, "is_redemption"]),
+                    created_at = current_appts[didx, "created_at"]
+                  )
+                  db_update_appointment(ap)
+                }
+              }
+              
+              # Remove the redemption appointment entirely
+              current_appts <- current_appts[current_appts$id != redemption_id, ]
+              appointments(current_appts)
+              # Persist delete in DB
+              db_delete_appointment(redemption_id)
+              
+              showNotification("↩️ Redemption unredeemed. Free appointment removed and points restored.", type = "message")
+            }
+            removeModal()
+          }, ignoreInit = TRUE, once = TRUE)
+        }, ignoreInit = TRUE)
+      })
+    }
     for (btn in archive_redemption_btns) {
       local({
         btn_name <- btn
@@ -1731,6 +1982,25 @@ server <- function(input, output, session) {
         }, ignoreInit = TRUE)
       })
     }
+    
+    # Redemption delete buttons
+    delete_redemption_btns <- grep("^delete_redemption_", all_inputs, value = TRUE)
+    for (btn in delete_redemption_btns) {
+      local({
+        btn_name <- btn
+        redemption_id <- sub("^delete_redemption_", "", btn_name)
+        
+        observeEvent(input[[btn_name]], {
+          show_delete_modal("redemption", redemption_id, function() {
+            current_appts <- appointments()
+            appointments(current_appts[current_appts$id != redemption_id, ])
+            # Persist delete
+            db_delete_appointment(redemption_id)
+            showNotification("Redemption deleted successfully", type = "message")
+          })
+        }, ignoreInit = TRUE)
+      })
+    }
   })
   
   # Show customer form when Add button is clicked
@@ -1781,11 +2051,10 @@ server <- function(input, output, session) {
       return()
     }
     
-    # Deduct points from existing appointments
+    # Deduct 100 points from existing appointments (include archived 'done' too)
     current_appts <- appointments()
     customer_appts_idx <- which(
       tolower(current_appts$customer_name) == tolower(customer_name) &
-        current_appts$status == "done" &
         current_appts$loyalty_points > 0
     )
     
