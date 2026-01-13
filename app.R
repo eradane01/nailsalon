@@ -1,5 +1,8 @@
 # Nailed it! - Nail Salon Manager Shiny Application
 
+# Set timezone to Philippine Time for consistent date/time across deployments
+Sys.setenv(TZ = "Asia/Manila")
+
 library(shiny)
 library(shinyjs)
 library(DBI)
