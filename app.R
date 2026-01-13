@@ -37,7 +37,46 @@ ui <- fluidPage(
   # Include custom CSS
   tags$head(
     tags$link(rel = "stylesheet", type = "text/css", href = "styles.css"),
-    tags$title("Nailed it! - Nail Salon Manager")
+    tags$title("Nailed it! - Nail Salon Manager"),
+    tags$meta(name = "viewport", content = "width=device-width, initial-scale=1"),
+    tags$style(HTML('
+      /* Responsive login layout + modern input styles */
+      .login-box { max-width: 560px; width: 92%; margin: 0 auto; }
+      .form-label { display: block; font-weight: 600; margin-bottom: 6px; }
+      .input-field { width: 100%; padding: 12px 14px; border-radius: 12px; border: 2px solid rgba(74,21,75,0.15); outline: none; transition: box-shadow .2s, border-color .2s; background: #fff; }
+      .input-field:focus { border-color: #ff69b4; box-shadow: 0 0 0 4px rgba(255,105,180,0.15); }
+      .password-wrapper { position: relative; }
+      .password-wrapper .eye-toggle { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); cursor: pointer; user-select: none; font-size: 18px; line-height: 1; padding: 6px; border-radius: 8px; }
+      .password-wrapper .eye-toggle:hover { background: rgba(0,0,0,0.06); }
+      #login_btn { cursor: pointer; position: relative; z-index: 10; pointer-events: auto !important; }
+      @media (max-width: 640px) {
+        .section-header h2 { font-size: 1.4rem; }
+        table.w-full thead { display: none; }
+        table.w-full tr { display: block; margin-bottom: 10px; }
+        table.w-full td { display: block; padding: 10px 12px; }
+      }
+    ')),
+    tags$script(HTML('
+      function togglePassword(id, checkboxId){
+        var el = document.getElementById(id);
+        var checkbox = document.getElementById(checkboxId);
+        if(!el) return;
+        if(checkbox.checked){ el.type = "text"; }
+        else { el.type = "password"; }
+      }
+      
+      // Sync display password input with hidden input before form submission
+      document.addEventListener("DOMContentLoaded", function(){
+        var displayInput = document.getElementById("login_password_display");
+        var hiddenInput = document.getElementById("login_password");
+        if(displayInput){
+          displayInput.addEventListener("input", function(){
+            if(hiddenInput) hiddenInput.value = displayInput.value;
+            Shiny.setInputValue("login_password", displayInput.value);
+          });
+        }
+      });
+    '))
   ),
   
   # Background
@@ -78,18 +117,27 @@ ui <- fluidPage(
             </svg>
           ')
         ),
-        h1(class = "font-playfair text-5xl font-black mb-3 shimmer-text", "Admin Login"),
-        p(class = "font-cormorant text-xl font-light italic", "Enter password to access salon manager")
+        h2(class = "font-playfair text-7xl font-black mb-2 shimmer-text", "Nailed it!"),
+        p(class = "font-cormorant text-4xl font-light italic mb-2", "Welcome Back, Admin"),
+        p(class = "font-cormorant text-2xl font-light italic mb-4", "Unlock your salon management dashboard")
       ),
       div(
         class = "space-y-6",
         div(
-          tags$label(class = "form-label", `for` = "login_username", "Username"),
+          tags$label(class = "form-label", `for` = "login_username", "Username", style = "font-size: 14px; font-weight: bold;"),
           textInput("login_username", NULL, placeholder = "Enter username", width = "100%")
         ),
         div(
-          tags$label(class = "form-label", `for` = "login_password", "Password"),
-          passwordInput("login_password", NULL, placeholder = "Enter password", width = "100%")
+          tags$label(class = "form-label", `for` = "login_password", "Password", style = "font-size: 14px; font-weight: bold;"),
+          div(
+            class = "password-wrapper",
+            tags$input(id = "login_password_display", type = "password", placeholder = "Enter password", class = "input-field", style = "width: 100%;"),
+            div(style = "margin-top: 10px; display: flex; align-items: center; gap: 8px;",
+                tags$input(id = "show_password_cb", type = "checkbox", style = "width: 18px; height: 18px; cursor: pointer;", onchange = "togglePassword('login_password_display', 'show_password_cb')"),
+                tags$label(`for` = "show_password_cb", "Show Password", style = "margin: 0; cursor: pointer; font-size: 14px;")
+            )
+          ),
+          tags$input(id = "login_password", type = "hidden", value = "")
         ),
         actionButton(
           "login_btn",
@@ -436,17 +484,22 @@ server <- function(input, output, session) {
     invalidateLater(60000, session)  # 60,000 ms = 1 minute
     appts_data <- appointments()
     updated <- FALSE
-    today <- Sys.Date()
-    current_time <- format(Sys.time(), "%I:%M %p")
     for (i in seq_len(nrow(appts_data))) {
-      appt_date <- as.Date(appts_data$date[i])
-      appt_time <- appts_data$time_slot[i]
       if (appts_data$status[i] == "pending") {
-        if (appt_date < today || (appt_date == today && appt_time <= current_time)) {
-          appts_data$status[i] <- "missed"
-          # Update in DB
-          db_update_appointment(list(id = appts_data$id[i], customer_name = appts_data$customer_name[i], services = appts_data$services[i], date = appts_data$date[i], time_slot = appts_data$time_slot[i], total_price = appts_data$total_price[i], status = "missed", loyalty_points = appts_data$loyalty_points[i], is_redemption = appts_data$is_redemption[i], created_at = appts_data$created_at[i]))
-          updated <- TRUE
+        # Parse scheduled date/time and mark missed if 2 hours have passed
+        date_str <- appts_data$date[i]
+        time_str <- appts_data$time_slot[i]
+        if (!is.na(date_str) && nzchar(date_str) && !is.na(time_str) && nzchar(time_str)) {
+          sched <- try(as.POSIXct(paste(date_str, time_str), format = "%Y-%m-%d %I:%M %p"), silent = TRUE)
+          if (!inherits(sched, "try-error") && !is.na(sched)) {
+            elapsed_mins <- as.numeric(difftime(Sys.time(), sched, units = "mins"))
+            if (!is.na(elapsed_mins) && elapsed_mins >= 120) {
+              appts_data$status[i] <- "missed"
+              # Update in DB
+              db_update_appointment(list(id = appts_data$id[i], customer_name = appts_data$customer_name[i], services = appts_data$services[i], date = appts_data$date[i], time_slot = appts_data$time_slot[i], total_price = appts_data$total_price[i], status = "missed", loyalty_points = appts_data$loyalty_points[i], is_redemption = appts_data$is_redemption[i], created_at = appts_data$created_at[i]))
+              updated <- TRUE
+            }
+          }
         }
       }
     }
